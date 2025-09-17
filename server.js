@@ -22,49 +22,134 @@ app.get("/healthz", (_req, res) => res.send("ok"));
  * Verify Shopify App Proxy signature.
  * Storefront path  : /apps/<subpath>/...
  * Your server path : /proxy/...
- * Query param      : ?signature=<hex> (HMAC-SHA256)
+ * Query param      : ?signature=<hex> (App Proxy) or ?hmac=<hex> (other flows)
+ *
+ * We:
+ *  - parse using SHOP (.myshopify.com) as base
+ *  - convert /proxy/... -> /apps/<subpath>/...
+ *  - remove signature/hmac
+ *  - SORT remaining params by key
+ *  - hash `${storefrontPath}?${sortedQuery}` (or just path if no params)
  */
 function verifyProxySignature(req) {
   try {
-    // Build URL from the request using SHOP (.myshopify.com) as base for consistent parsing
-    const url = new URL(req.originalUrl, `https://${process.env.SHOP}`);
+    const base = `https://${process.env.SHOP}`; // MUST be *.myshopify.com
+    const originalUrl = req.originalUrl || req.url || "/";
+    const url = new URL(originalUrl, base);
 
+    // Prefer `signature` (App Proxy), fallback to `hmac`
     const params = new URLSearchParams(url.search);
-    const signature = params.get("signature");
+    const signature = params.get("signature") || params.get("hmac");
+
     if (!signature) {
-      DBG("NO signature param; originalUrl=", req.originalUrl);
+      DBG("NO signature/hmac param found");
+      DBG("originalUrl =", originalUrl);
+      DBG("pathname   =", url.pathname);
+      DBG("search     =", url.search);
       return false;
     }
 
-    // Remove signature before hashing
-    params.delete("signature");
-
-    // Convert /proxy/... back to /apps/<subpath>/...
+    const proxyPrefix = process.env.PROXY_PREFIX || "apps";
+    const proxySub = process.env.PROXY_SUBPATH || "rfq";
     const storefrontPath = url.pathname.replace(
       /^\/proxy/,
-      `/${process.env.PROXY_PREFIX || "apps"}/${process.env.PROXY_SUBPATH || "rfq"}`
+      `/${proxyPrefix}/${proxySub}`
     );
 
-    const message = `${storefrontPath}?${params.toString()}`;
+    // Remove signature params then sort remaining keys
+    const work = new URLSearchParams(url.search);
+    work.delete("signature");
+    work.delete("hmac");
 
+    const sortedKeys = Array.from(work.keys()).sort();
+    const sortedPairs = [];
+    for (const k of sortedKeys) {
+      const vals = work.getAll(k);
+      for (const v of vals) sortedPairs.push(`${k}=${v}`);
+    }
+    const sortedQuery = sortedPairs.join("&");
+
+    const message = sortedQuery ? `${storefrontPath}?${sortedQuery}` : storefrontPath;
+
+    const secret = process.env.SHOPIFY_API_SECRET || "";
     const digest = crypto
-      .createHmac("sha256", process.env.SHOPIFY_API_SECRET)
+      .createHmac("sha256", secret)
       .update(message)
       .digest("hex");
 
-    // Verbose debug
-    DBG("originalUrl:", req.originalUrl);
-    DBG("storefrontPath:", storefrontPath);
-    DBG("message     :", message);
-    DBG("signature   :", signature);
-    DBG("digest      :", digest);
+    // Debug info
+    DBG("==== App Proxy HMAC DEBUG ====");
+    DBG("SHOP                :", process.env.SHOP);
+    DBG("originalUrl         :", originalUrl);
+    DBG("server pathname     :", url.pathname);
+    DBG("storefrontPath      :", storefrontPath);
+    DBG("raw query           :", url.search);
+    DBG("sortedKeys          :", sortedKeys);
+    DBG("sortedQuery         :", sortedQuery);
+    DBG("message (hashed)    :", message);
+    DBG("provided signature  :", signature);
+    DBG("computed digest     :", digest);
+    DBG(
+      "secret len/preview  :",
+      secret.length,
+      secret.slice(0, 4) + "..." + secret.slice(-4)
+    );
+    DBG("==============================");
 
-    // Compare in constant time
-    return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(signature));
+    // timing-safe compare (avoid throw on length mismatch)
+    const sigBuf = Buffer.from(signature, "utf8");
+    const digBuf = Buffer.from(digest, "utf8");
+    if (sigBuf.length !== digBuf.length) return false;
+
+    return crypto.timingSafeEqual(digBuf, sigBuf);
   } catch (e) {
     DBG("verify error:", e);
     return false;
   }
+}
+
+/** Optional debug endpoint: shows what the server WILL hash (no verification). */
+if (process.env.DEBUG_PROXY === "1") {
+  app.get("/proxy/_debug", (req, res) => {
+    try {
+      const base = `https://${process.env.SHOP}`;
+      const originalUrl = req.originalUrl || req.url || "/";
+      const url = new URL(originalUrl, base);
+
+      const proxyPrefix = process.env.PROXY_PREFIX || "apps";
+      const proxySub = process.env.PROXY_SUBPATH || "rfq";
+      const storefrontPath = url.pathname.replace(
+        /^\/proxy/,
+        `/${proxyPrefix}/${proxySub}`
+      );
+
+      const work = new URLSearchParams(url.search);
+      work.delete("signature");
+      work.delete("hmac");
+
+      const sortedKeys = Array.from(work.keys()).sort();
+      const sortedPairs = [];
+      for (const k of sortedKeys) {
+        const vals = work.getAll(k);
+        for (const v of vals) sortedPairs.push(`${k}=${v}`);
+      }
+      const sortedQuery = sortedPairs.join("&");
+      const message = sortedQuery ? `${storefrontPath}?${sortedQuery}` : storefrontPath;
+
+      res.json({
+        SHOP: process.env.SHOP,
+        originalUrl,
+        serverPathname: url.pathname,
+        storefrontPath,
+        rawQuery: url.search,
+        sortedKeys,
+        sortedQuery,
+        messageHashed: message
+      });
+    } catch (e) {
+      res.status(500).json({ error: String(e) });
+    }
+  });
 }
 
 async function adminFetch(path, options = {}) {
@@ -114,7 +199,7 @@ async function findOrCreateCustomer(cust) {
 // MAIN endpoint (called from your storefront via App Proxy)
 app.post("/proxy/create-draft-order", async (req, res) => {
   try {
-    // Optional quick view of incoming headers/query when debugging
+    // Quick visibility while debugging
     DBG("incoming host:", req.headers.host);
     DBG("incoming path:", req.path);
     DBG("incoming query:", req.query);
