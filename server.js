@@ -9,7 +9,12 @@ const app = express();
 app.set("trust proxy", true);
 app.use(express.json());
 
-// simple root + health
+// Simple logger gated by DEBUG_PROXY=1
+const DBG = (...args) => {
+  if (process.env.DEBUG_PROXY === "1") console.log("[proxy]", ...args);
+};
+
+// Root + health
 app.get("/", (_req, res) => res.send("RFQ app running"));
 app.get("/healthz", (_req, res) => res.send("ok"));
 
@@ -21,16 +26,20 @@ app.get("/healthz", (_req, res) => res.send("ok"));
  */
 function verifyProxySignature(req) {
   try {
+    // Build URL from the request using SHOP (.myshopify.com) as base for consistent parsing
     const url = new URL(req.originalUrl, `https://${process.env.SHOP}`);
 
     const params = new URLSearchParams(url.search);
     const signature = params.get("signature");
-    if (!signature) return false;
+    if (!signature) {
+      DBG("NO signature param; originalUrl=", req.originalUrl);
+      return false;
+    }
 
-    // Canonicalize by removing signature from query before hashing
+    // Remove signature before hashing
     params.delete("signature");
 
-    // Convert /proxy/... back to original storefront path /apps/<subpath>/...
+    // Convert /proxy/... back to /apps/<subpath>/...
     const storefrontPath = url.pathname.replace(
       /^\/proxy/,
       `/${process.env.PROXY_PREFIX || "apps"}/${process.env.PROXY_SUBPATH || "rfq"}`
@@ -43,8 +52,17 @@ function verifyProxySignature(req) {
       .update(message)
       .digest("hex");
 
+    // Verbose debug
+    DBG("originalUrl:", req.originalUrl);
+    DBG("storefrontPath:", storefrontPath);
+    DBG("message     :", message);
+    DBG("signature   :", signature);
+    DBG("digest      :", digest);
+
+    // Compare in constant time
     return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(signature));
-  } catch {
+  } catch (e) {
+    DBG("verify error:", e);
     return false;
   }
 }
@@ -61,6 +79,7 @@ async function adminFetch(path, options = {}) {
   });
   if (!res.ok) {
     const text = await res.text();
+    DBG("adminFetch error:", res.status, text);
     throw new Error(`${res.status} ${text}`);
   }
   return res.json();
@@ -95,10 +114,20 @@ async function findOrCreateCustomer(cust) {
 // MAIN endpoint (called from your storefront via App Proxy)
 app.post("/proxy/create-draft-order", async (req, res) => {
   try {
+    // Optional quick view of incoming headers/query when debugging
+    DBG("incoming host:", req.headers.host);
+    DBG("incoming path:", req.path);
+    DBG("incoming query:", req.query);
+
     if (process.env.ALLOW_UNVERIFIED_PROXY !== "1") {
-      if (!verifyProxySignature(req)) {
+      const ok = verifyProxySignature(req);
+      if (!ok) {
+        DBG("HMAC verification FAILED");
         return res.status(401).json({ error: "Invalid HMAC" });
       }
+      DBG("HMAC verification PASSED");
+    } else {
+      DBG("HMAC verification BYPASSED (ALLOW_UNVERIFIED_PROXY=1)");
     }
 
     const {
@@ -153,6 +182,8 @@ app.post("/proxy/create-draft-order", async (req, res) => {
       }
     };
 
+    DBG("creating draft order with payload:", JSON.stringify(payload));
+
     const out = await adminFetch(`/draft_orders.json`, {
       method: "POST",
       body: JSON.stringify(payload)
@@ -161,11 +192,7 @@ app.post("/proxy/create-draft-order", async (req, res) => {
     const invoice = out?.draft_order?.invoice_url;
     if (!invoice) throw new Error("No invoice_url returned");
 
-    // Optional: auto-email invoice
-    // await adminFetch(`/draft_orders/${out.draft_order.id}/send_invoice.json`, {
-    //   method: "POST",
-    //   body: JSON.stringify({ draft_order_invoice: {} })
-    // });
+    DBG("draft_order_id:", out.draft_order.id, "invoice_url:", invoice);
 
     res.json({
       invoice_url: invoice,
@@ -178,4 +205,16 @@ app.post("/proxy/create-draft-order", async (req, res) => {
 });
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`Listening on ${port}`));
+app.listen(port, () => {
+  console.log(`Listening on ${port}`);
+  if (process.env.DEBUG_PROXY === "1") {
+    console.log("DEBUG_PROXY is ON");
+    console.log("Env summary:", {
+      SHOP: process.env.SHOP,
+      API_VERSION: process.env.API_VERSION,
+      PROXY_PREFIX: process.env.PROXY_PREFIX,
+      PROXY_SUBPATH: process.env.PROXY_SUBPATH,
+      ALLOW_UNVERIFIED_PROXY: process.env.ALLOW_UNVERIFIED_PROXY || "0"
+    });
+  }
+});
