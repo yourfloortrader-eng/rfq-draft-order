@@ -25,7 +25,7 @@ app.get("/healthz", (_req, res) => res.send("ok"));
  * Query param      : ?signature=<hex> (App Proxy) or ?hmac=<hex> (other flows)
  *
  * We:
- *  - parse using SHOP (.myshopify.com) as base
+ *  - parse using the *shop param if present* (fallback to SHOP env) as base
  *  - convert /proxy/... -> /apps/<subpath>/...
  *  - remove signature/hmac
  *  - SORT remaining params by key
@@ -33,9 +33,14 @@ app.get("/healthz", (_req, res) => res.send("ok"));
  */
 function verifyProxySignature(req) {
   try {
-    const base = `https://${process.env.SHOP}`; // MUST be *.myshopify.com
     const originalUrl = req.originalUrl || req.url || "/";
-    const url = new URL(originalUrl, base);
+
+    // Prefer the shop param (preview domains differ from permanent *.myshopify.com)
+    const qs = originalUrl.split("?")[1] || "";
+    const parsedQs = new URLSearchParams(qs);
+    const shopParam = (parsedQs.get("shop") || "").toLowerCase();
+    const baseShop = shopParam || (process.env.SHOP || "").toLowerCase();
+    const url = new URL(originalUrl, `https://${baseShop}`);
 
     // Prefer `signature` (App Proxy), fallback to `hmac`
     const params = new URLSearchParams(url.search);
@@ -44,6 +49,7 @@ function verifyProxySignature(req) {
     if (!signature) {
       DBG("NO signature/hmac param found");
       DBG("originalUrl =", originalUrl);
+      DBG("baseShop   =", baseShop);
       DBG("pathname   =", url.pathname);
       DBG("search     =", url.search);
       return false;
@@ -79,7 +85,8 @@ function verifyProxySignature(req) {
 
     // Debug info
     DBG("==== App Proxy HMAC DEBUG ====");
-    DBG("SHOP                :", process.env.SHOP);
+    DBG("shop param          :", shopParam || "(none)");
+    DBG("baseShop used       :", baseShop);
     DBG("originalUrl         :", originalUrl);
     DBG("server pathname     :", url.pathname);
     DBG("storefrontPath      :", storefrontPath);
@@ -92,7 +99,7 @@ function verifyProxySignature(req) {
     DBG(
       "secret len/preview  :",
       secret.length,
-      secret.slice(0, 4) + "..." + secret.slice(-4)
+      secret ? secret.slice(0, 4) + "..." + secret.slice(-4) : "(empty)"
     );
     DBG("==============================");
 
@@ -112,9 +119,14 @@ function verifyProxySignature(req) {
 if (process.env.DEBUG_PROXY === "1") {
   app.get("/proxy/_debug", (req, res) => {
     try {
-      const base = `https://${process.env.SHOP}`;
       const originalUrl = req.originalUrl || req.url || "/";
-      const url = new URL(originalUrl, base);
+
+      // Same base selection as the verifier
+      const qs = originalUrl.split("?")[1] || "";
+      const parsedQs = new URLSearchParams(qs);
+      const shopParam = (parsedQs.get("shop") || "").toLowerCase();
+      const baseShop = shopParam || (process.env.SHOP || "").toLowerCase();
+      const url = new URL(originalUrl, `https://${baseShop}`);
 
       const proxyPrefix = process.env.PROXY_PREFIX || "apps";
       const proxySub = process.env.PROXY_SUBPATH || "rfq";
@@ -137,7 +149,8 @@ if (process.env.DEBUG_PROXY === "1") {
       const message = sortedQuery ? `${storefrontPath}?${sortedQuery}` : storefrontPath;
 
       res.json({
-        SHOP: process.env.SHOP,
+        shopParam: shopParam || "(none)",
+        baseShop,
         originalUrl,
         serverPathname: url.pathname,
         storefrontPath,
