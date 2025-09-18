@@ -5,6 +5,13 @@ import fetch from "node-fetch";
 import dotenv from "dotenv";
 dotenv.config();
 
+// DEBUG: show token length only (safe)
+if (process.env.DEBUG_PROXY === "1") {
+  const t = process.env.SHOPIFY_ADMIN_TOKEN || "";
+  console.log("ADMIN TOKEN LENGTH:", t.length);
+}
+
+
 const app = express();
 app.set("trust proxy", true);
 app.use(express.json());
