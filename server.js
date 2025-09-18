@@ -1,36 +1,90 @@
-// server.js
+// server.js (deploy-ready)
 import express from "express";
 import crypto from "crypto";
 import fetch from "node-fetch";
 import dotenv from "dotenv";
 dotenv.config();
 
-// DEBUG: show token length only (safe)
-if (process.env.DEBUG_PROXY === "1") {
-  const t = process.env.SHOPIFY_ADMIN_TOKEN || "";
-  console.log("ADMIN TOKEN LENGTH:", t.length);
+/* =========================
+   0) ENV VALIDATION / CONFIG
+   ========================= */
+const REQUIRED = [
+  "SHOP",                 // floortaderwholesale.myshopify.com
+  "API_VERSION",          // e.g. 2025-07
+  "SHOPIFY_ADMIN_TOKEN",  // shpat_...
+  "SHOPIFY_API_SECRET"    // from Admin API credentials
+];
+
+const missing = REQUIRED.filter((k) => !process.env[k]);
+if (missing.length) {
+  console.error(
+    "Missing required environment variables:",
+    missing.join(", ")
+  );
+  process.exit(1);
 }
 
+// Optional config with defaults
+const DEBUG = process.env.DEBUG_PROXY === "1";
+const ALLOW_UNVERIFIED = process.env.ALLOW_UNVERIFIED_PROXY === "1";
+const PROXY_PREFIX = process.env.PROXY_PREFIX || "apps";
+const PROXY_SUBPATH = process.env.PROXY_SUBPATH || "rfq";
+const MOUNT_PREFIX = "/proxy"; // where the server endpoint is mounted
 
+// Show safe diagnostics (no secrets)
+if (DEBUG) {
+  const t = process.env.SHOPIFY_ADMIN_TOKEN || "";
+  console.log("DEBUG mode ON");
+  console.log("ADMIN TOKEN LENGTH:", t.length);
+  console.log("SHOP:", process.env.SHOP);
+  console.log("API_VERSION:", process.env.API_VERSION);
+  console.log("PROXY_PREFIX:", PROXY_PREFIX);
+  console.log("PROXY_SUBPATH:", PROXY_SUBPATH);
+  console.log("ALLOW_UNVERIFIED_PROXY:", ALLOW_UNVERIFIED ? "1" : "0");
+}
+
+/* ===============
+   1) APP BOOTSTRAP
+   =============== */
 const app = express();
 app.set("trust proxy", true);
-app.use(express.json());
 
-// Simple logger gated by DEBUG_PROXY=1
+// Body limit: protect server. Increase if you expect larger payloads.
+app.use(express.json({ limit: "100kb" }));
+
+// (Optional) very light CORS allow-list for your storefront domain(s).
+// Comment this out if your App Proxy calls are same-origin.
+const CORS_ALLOW = (process.env.CORS_ALLOW_ORIGINS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+if (CORS_ALLOW.length) {
+  app.use((req, res, next) => {
+    const o = req.headers.origin || "";
+    if (CORS_ALLOW.includes(o)) {
+      res.setHeader("Access-Control-Allow-Origin", o);
+      res.setHeader("Vary", "Origin");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
+      res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
+      if (req.method === "OPTIONS") return res.sendStatus(204);
+    }
+    next();
+  });
+}
+
+// Small helper logger
 const DBG = (...args) => {
-  if (process.env.DEBUG_PROXY === "1") console.log("[proxy]", ...args);
+  if (DEBUG) console.log("[proxy]", ...args);
 };
 
-// Root + health
+// Health + root
 app.get("/", (_req, res) => res.send("RFQ app running"));
 app.get("/healthz", (_req, res) => res.send("ok"));
 
-/**
- * Verify Shopify App Proxy signature using the RAW query string.
- *
- * What we hash:
- *   <decoded path_prefix><serverPathname>?<rawQueryString WITHOUT signature/hmac>
- */
+/* ================================
+   2) SHOPIFY APP PROXY VERIFICATION
+   ================================ */
 function verifyProxySignature(req) {
   try {
     const secret = process.env.SHOPIFY_API_SECRET || "";
@@ -42,17 +96,22 @@ function verifyProxySignature(req) {
     // e.g. "/proxy/create-draft-order?shop=...&path_prefix=%2Fapps%2Frfq&timestamp=...&signature=..."
     const originalUrl = req.originalUrl || req.url || "/";
     const qmark = originalUrl.indexOf("?");
-
     const rawPath = qmark === -1 ? originalUrl : originalUrl.slice(0, qmark);
-    const rawQuery = qmark === -1 ? "" : originalUrl.slice(qmark + 1); // no leading "?"
+    const rawQuery = qmark === -1 ? "" : originalUrl.slice(qmark + 1); // without leading "?"
 
-    // 1) extract provided signature/hmac from RAW query
+    // Extract provided signature OR hmac
     let providedSignature = "";
     if (rawQuery) {
       const pairs = rawQuery.split("&");
       for (const kv of pairs) {
-        if (kv.startsWith("signature=")) { providedSignature = kv.slice(10); break; }
-        if (kv.startsWith("hmac="))      { providedSignature = kv.slice(5);  break; }
+        if (kv.startsWith("signature=")) {
+          providedSignature = kv.slice("signature=".length);
+          break;
+        }
+        if (kv.startsWith("hmac=")) {
+          providedSignature = kv.slice("hmac=".length);
+          break;
+        }
       }
     }
     if (!providedSignature) {
@@ -60,32 +119,36 @@ function verifyProxySignature(req) {
       return false;
     }
 
-    // 2) build storefront path from path_prefix + serverPathname
-    const serverMountPrefix = "/proxy";
-    const serverPathname = rawPath.startsWith(serverMountPrefix)
-      ? rawPath.slice(serverMountPrefix.length) // e.g. "/create-draft-order"
+    // Remove our own mount prefix from the path
+    const serverPathname = rawPath.startsWith(MOUNT_PREFIX)
+      ? rawPath.slice(MOUNT_PREFIX.length) // e.g. "/create-draft-order"
       : rawPath;
 
+    // Build storefront path: decoded path_prefix + serverPathname
     let decodedPathPrefix = "";
     if (rawQuery) {
-      for (const kv of rawQuery.split("&")) {
+      const pairs = rawQuery.split("&");
+      for (const kv of pairs) {
         const eq = kv.indexOf("=");
         const key = eq === -1 ? kv : kv.slice(0, eq);
         const val = eq === -1 ? "" : kv.slice(eq + 1);
         if (key === "path_prefix") {
-          try { decodedPathPrefix = decodeURIComponent(val || ""); }
-          catch { decodedPathPrefix = val || ""; }
+          try {
+            decodedPathPrefix = decodeURIComponent(val || "");
+          } catch {
+            decodedPathPrefix = val || "";
+          }
           break;
         }
       }
     }
     if (!decodedPathPrefix) {
-      decodedPathPrefix = `/${process.env.PROXY_PREFIX || "apps"}/${process.env.PROXY_SUBPATH || "rfq"}`;
+      decodedPathPrefix = `/${PROXY_PREFIX}/${PROXY_SUBPATH}`;
     }
 
     const storefrontPath = `${decodedPathPrefix}${serverPathname}`;
 
-    // 3) keep RAW query but drop signature/hmac
+    // Keep query string as-is but drop signature/hmac
     let keptQuery = "";
     if (rawQuery) {
       const kept = [];
@@ -96,16 +159,16 @@ function verifyProxySignature(req) {
       keptQuery = kept.join("&");
     }
 
-    // 4) final message to hash
+    // Build message
     const message = keptQuery ? `${storefrontPath}?${keptQuery}` : storefrontPath;
 
-    // 5) compute digest and timing-safe compare
+    // Compute digest + timing-safe compare
     const digest = crypto.createHmac("sha256", secret).update(message, "utf8").digest("hex");
     const sigBuf = Buffer.from(providedSignature, "utf8");
     const digBuf = Buffer.from(digest, "utf8");
     const ok = sigBuf.length === digBuf.length && crypto.timingSafeEqual(digBuf, sigBuf);
 
-    if (process.env.DEBUG_PROXY === "1") {
+    if (DEBUG) {
       console.log("==== App Proxy HMAC DEBUG ====");
       console.log("originalUrl        :", originalUrl);
       console.log("server pathname    :", serverPathname);
@@ -116,7 +179,6 @@ function verifyProxySignature(req) {
       console.log("message (hashed)   :", message);
       console.log("provided signature :", providedSignature);
       console.log("computed digest    :", digest);
-      console.log("secret len/preview :", secret.length, secret ? secret.slice(0,4)+"..."+secret.slice(-4) : "(empty)");
       console.log("==============================");
     }
 
@@ -127,18 +189,17 @@ function verifyProxySignature(req) {
   }
 }
 
-/** Optional debug endpoint to show what we will hash (no verification). */
-if (process.env.DEBUG_PROXY === "1") {
-  app.get("/proxy/_debug", (req, res) => {
+// Optional debug endpoint
+if (DEBUG) {
+  app.get(`${MOUNT_PREFIX}/_debug`, (req, res) => {
     try {
       const originalUrl = req.originalUrl || req.url || "/";
       const qmark = originalUrl.indexOf("?");
       const rawPath = qmark === -1 ? originalUrl : originalUrl.slice(0, qmark);
       const rawQuery = qmark === -1 ? "" : originalUrl.slice(qmark + 1);
 
-      const serverMountPrefix = "/proxy";
-      const serverPathname = rawPath.startsWith(serverMountPrefix)
-        ? rawPath.slice(serverMountPrefix.length)
+      const serverPathname = rawPath.startsWith(MOUNT_PREFIX)
+        ? rawPath.slice(MOUNT_PREFIX.length)
         : rawPath;
 
       let decodedPathPrefix = "";
@@ -148,14 +209,17 @@ if (process.env.DEBUG_PROXY === "1") {
           const key = eq === -1 ? kv : kv.slice(0, eq);
           const val = eq === -1 ? "" : kv.slice(eq + 1);
           if (key === "path_prefix") {
-            try { decodedPathPrefix = decodeURIComponent(val || ""); }
-            catch { decodedPathPrefix = val || ""; }
+            try {
+              decodedPathPrefix = decodeURIComponent(val || "");
+            } catch {
+              decodedPathPrefix = val || "";
+            }
             break;
           }
         }
       }
       if (!decodedPathPrefix) {
-        decodedPathPrefix = `/${process.env.PROXY_PREFIX || "apps"}/${process.env.PROXY_SUBPATH || "rfq"}`;
+        decodedPathPrefix = `/${PROXY_PREFIX}/${PROXY_SUBPATH}`;
       }
 
       const storefrontPath = `${decodedPathPrefix}${serverPathname}`;
@@ -185,6 +249,9 @@ if (process.env.DEBUG_PROXY === "1") {
   });
 }
 
+/* ===================
+   3) SHOPIFY ADMIN API
+   =================== */
 async function adminFetch(path, options = {}) {
   const url = `https://${process.env.SHOP}/admin/api/${process.env.API_VERSION}${path}`;
   const res = await fetch(url, {
@@ -229,14 +296,22 @@ async function findOrCreateCustomer(cust) {
   return id;
 }
 
-// MAIN endpoint (called from your storefront via App Proxy)
-app.post("/proxy/create-draft-order", async (req, res) => {
+/* ==========================
+   4) MAIN RFQ / DRAFT ENDPOINT
+   ========================== */
+
+// Disallow GET for safety
+app.get(`${MOUNT_PREFIX}/create-draft-order`, (_req, res) =>
+  res.status(405).json({ error: "Method Not Allowed" })
+);
+
+app.post(`${MOUNT_PREFIX}/create-draft-order`, async (req, res) => {
   try {
     DBG("incoming host:", req.headers.host);
     DBG("incoming path:", req.path);
     DBG("incoming query:", req.query);
 
-    if (process.env.ALLOW_UNVERIFIED_PROXY !== "1") {
+    if (!ALLOW_UNVERIFIED) {
       const ok = verifyProxySignature(req);
       if (!ok) {
         DBG("HMAC verification FAILED");
@@ -262,7 +337,7 @@ app.post("/proxy/create-draft-order", async (req, res) => {
 
     const customerId = await findOrCreateCustomer(customer);
 
-    // ----- build readable note + structured note_attributes
+    // Pretty note and structured attributes
     const fullName = [customer.first_name, customer.last_name].filter(Boolean).join(" ");
     const contactBits = [
       customer.email && `Email: ${customer.email}`,
@@ -292,15 +367,12 @@ app.post("/proxy/create-draft-order", async (req, res) => {
     const note_attributes = [
       { name: "rfq_installer_needed", value: installer_needed ? "Yes" : "No" },
       { name: "rfq_shipping_method",  value: shipping_method || "" },
-
       { name: "rfq_customer_first_name", value: customer.first_name || "" },
       { name: "rfq_customer_last_name",  value: customer.last_name  || "" },
       { name: "rfq_customer_email",      value: customer.email      || "" },
       { name: "rfq_customer_phone",      value: customer.phone      || "" },
       { name: "rfq_customer_company",    value: customer.company    || "" },
-
       { name: "rfq_message", value: note || "" },
-
       { name: "rfq_address1", value: shipping.address1 || "" },
       { name: "rfq_address2", value: shipping.address2 || "" },
       { name: "rfq_city",     value: shipping.city     || "" },
@@ -309,7 +381,6 @@ app.post("/proxy/create-draft-order", async (req, res) => {
       { name: "rfq_country",  value: shipping.country  || "" },
     ].filter(p => (p.value ?? "") !== "");
 
-    // ----- draft payload
     const payload = {
       draft_order: {
         line_items: line_items.map((li) => ({
@@ -320,8 +391,6 @@ app.post("/proxy/create-draft-order", async (req, res) => {
           properties: li.properties || []
         })),
         customer: { id: customerId },
-
-        // Only attach a shipping address when provided
         shipping_address: shipping?.address1
           ? {
               first_name: customer.first_name || "",
@@ -336,11 +405,8 @@ app.post("/proxy/create-draft-order", async (req, res) => {
               company:    customer.company  || ""
             }
           : undefined,
-
-        // Human-friendly note + structured attributes
         note: prettyNote,
         note_attributes,
-
         tags: "RFQ,DraftOrder,WebForm",
         use_customer_default_address: true
       }
@@ -360,8 +426,7 @@ app.post("/proxy/create-draft-order", async (req, res) => {
     const adminUrl = `https://${process.env.SHOP}/admin/draft_orders/${id}`;
     DBG("draft_order_id:", id, "admin_url:", adminUrl, "invoice_url:", invoice);
 
-    // ======= Response shape =======
-    // Default: reference + admin link (+ invoice_url if you want to send/open later)
+    // Default response: reference + admin link (+invoice if you want to open later)
     if (req.query.verbose === "1") {
       return res.json({
         reference: id,
@@ -371,24 +436,36 @@ app.post("/proxy/create-draft-order", async (req, res) => {
       });
     }
     return res.json({ reference: id, admin_url: adminUrl, invoice_url: invoice });
-    // ===============================
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message });
   }
 });
 
-const port = process.env.PORT || 3000;
-app.listen(port, () => {
-  console.log(`Listening on ${port}`);
-  if (process.env.DEBUG_PROXY === "1") {
-    console.log("DEBUG_PROXY is ON");
-    console.log("Env summary:", {
-      SHOP: process.env.SHOP,
-      API_VERSION: process.env.API_VERSION,
-      PROXY_PREFIX: process.env.PROXY_PREFIX,
-      PROXY_SUBPATH: process.env.PROXY_SUBPATH,
-      ALLOW_UNVERIFIED_PROXY: process.env.ALLOW_UNVERIFIED_PROXY || "0"
-    });
-  }
+/* ==================
+   5) FALLBACK / ERRORS
+   ================== */
+app.use((req, res) => {
+  res.status(404).json({ error: "Not Found" });
 });
+
+/* =======================
+   6) START & GRACEFUL STOP
+   ======================= */
+const port = process.env.PORT || 3000;
+const server = app.listen(port, () => {
+  console.log(`Listening on ${port}`);
+});
+
+function shutdown(signal) {
+  console.log(`\n${signal} received, shutting down…`);
+  server.close(() => {
+    console.log("HTTP server closed.");
+    process.exit(0);
+  });
+  // Force-exit if close hangs
+  setTimeout(() => process.exit(1), 10_000).unref();
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
