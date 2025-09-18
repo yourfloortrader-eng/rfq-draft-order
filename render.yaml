@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: rfq-draft-order
+    env: node
+    plan: free
+    buildCommand: "npm ci"
+    startCommand: "npm start"
+    autoDeploy: true
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_VERSION
+        value: 22
