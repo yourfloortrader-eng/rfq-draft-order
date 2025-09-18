@@ -23,14 +23,6 @@ app.get("/healthz", (_req, res) => res.send("ok"));
  *
  * What we hash:
  *   <decoded path_prefix><serverPathname>?<rawQueryString WITHOUT signature/hmac>
- *
- * Example final message (from your logs):
- *   /apps/rfq/create-draft-order?shop=v190v1-i8.myshopify.com&logged_in_customer_id=&path_prefix=%2Fapps%2Frfq&timestamp=1758218963
- *
- * Notes:
- * - We do NOT decode/re-encode the kept query string.
- * - We keep original order and encoding of all pairs except we remove `signature=` (or `hmac=`).
- * - `path_prefix` is used ONLY to build the path (decoded), not modified in the query.
  */
 function verifyProxySignature(req) {
   try {
@@ -47,20 +39,13 @@ function verifyProxySignature(req) {
     const rawPath = qmark === -1 ? originalUrl : originalUrl.slice(0, qmark);
     const rawQuery = qmark === -1 ? "" : originalUrl.slice(qmark + 1); // no leading "?"
 
-    // --- 1) Extract provided signature (or hmac) directly from the raw query
+    // 1) extract provided signature/hmac from RAW query
     let providedSignature = "";
     if (rawQuery) {
-      // find "signature=" or "hmac=" pairs (App Proxy uses `signature`)
       const pairs = rawQuery.split("&");
       for (const kv of pairs) {
-        if (kv.startsWith("signature=")) {
-          providedSignature = kv.slice("signature=".length);
-          break;
-        }
-        if (kv.startsWith("hmac=")) {
-          providedSignature = kv.slice("hmac=".length);
-          break;
-        }
+        if (kv.startsWith("signature=")) { providedSignature = kv.slice(10); break; }
+        if (kv.startsWith("hmac="))      { providedSignature = kv.slice(5);  break; }
       }
     }
     if (!providedSignature) {
@@ -68,68 +53,47 @@ function verifyProxySignature(req) {
       return false;
     }
 
-    // --- 2) Build the storefront path:
-    // serverMountPrefix = "/proxy" (your Render/Express mount)
+    // 2) build storefront path from path_prefix + serverPathname
     const serverMountPrefix = "/proxy";
     const serverPathname = rawPath.startsWith(serverMountPrefix)
       ? rawPath.slice(serverMountPrefix.length) // e.g. "/create-draft-order"
       : rawPath;
 
-    // Read path_prefix from the RAW query without changing order.
-    // We must decode ONLY the value we use to build the path.
     let decodedPathPrefix = "";
     if (rawQuery) {
-      const pairs = rawQuery.split("&");
-      for (const kv of pairs) {
+      for (const kv of rawQuery.split("&")) {
         const eq = kv.indexOf("=");
         const key = eq === -1 ? kv : kv.slice(0, eq);
         const val = eq === -1 ? "" : kv.slice(eq + 1);
         if (key === "path_prefix") {
-          // decode just for the path construction
-          try {
-            decodedPathPrefix = decodeURIComponent(val || "");
-          } catch {
-            decodedPathPrefix = val || "";
-          }
+          try { decodedPathPrefix = decodeURIComponent(val || ""); }
+          catch { decodedPathPrefix = val || ""; }
           break;
         }
       }
     }
-
-    // Fallback if env is used
     if (!decodedPathPrefix) {
-      const fallback = `/${process.env.PROXY_PREFIX || "apps"}/${process.env.PROXY_SUBPATH || "rfq"}`;
-      decodedPathPrefix = fallback;
+      decodedPathPrefix = `/${process.env.PROXY_PREFIX || "apps"}/${process.env.PROXY_SUBPATH || "rfq"}`;
     }
 
-    // storefrontPath = decoded path_prefix + serverPathname
     const storefrontPath = `${decodedPathPrefix}${serverPathname}`;
 
-    // --- 3) Keep the RAW query string but drop ONLY the signature/hmac pair(s).
-    // Preserve original order and encoding of all other pairs.
+    // 3) keep RAW query but drop signature/hmac
     let keptQuery = "";
     if (rawQuery) {
       const kept = [];
       for (const kv of rawQuery.split("&")) {
-        if (
-          kv.startsWith("signature=") ||
-          kv.startsWith("hmac=") ||
-          kv === "" // ignore empty fragments
-        ) {
-          continue;
-        }
+        if (kv.startsWith("signature=") || kv.startsWith("hmac=") || kv === "") continue;
         kept.push(kv);
       }
       keptQuery = kept.join("&");
     }
 
-    // --- 4) Final message to hash (include "?" only if there are params)
+    // 4) final message to hash
     const message = keptQuery ? `${storefrontPath}?${keptQuery}` : storefrontPath;
 
-    // --- 5) Compute digest
+    // 5) compute digest and timing-safe compare
     const digest = crypto.createHmac("sha256", secret).update(message, "utf8").digest("hex");
-
-    // --- 6) Timing-safe compare
     const sigBuf = Buffer.from(providedSignature, "utf8");
     const digBuf = Buffer.from(digest, "utf8");
     const ok = sigBuf.length === digBuf.length && crypto.timingSafeEqual(digBuf, sigBuf);
@@ -145,10 +109,7 @@ function verifyProxySignature(req) {
       console.log("message (hashed)   :", message);
       console.log("provided signature :", providedSignature);
       console.log("computed digest    :", digest);
-      console.log(
-        "secret len/preview :", secret.length,
-        secret ? secret.slice(0, 4) + "..." + secret.slice(-4) : "(empty)"
-      );
+      console.log("secret len/preview :", secret.length, secret ? secret.slice(0,4)+"..."+secret.slice(-4) : "(empty)");
       console.log("==============================");
     }
 
@@ -180,11 +141,8 @@ if (process.env.DEBUG_PROXY === "1") {
           const key = eq === -1 ? kv : kv.slice(0, eq);
           const val = eq === -1 ? "" : kv.slice(eq + 1);
           if (key === "path_prefix") {
-            try {
-              decodedPathPrefix = decodeURIComponent(val || "");
-            } catch {
-              decodedPathPrefix = val || "";
-            }
+            try { decodedPathPrefix = decodeURIComponent(val || ""); }
+            catch { decodedPathPrefix = val || ""; }
             break;
           }
         }
@@ -297,6 +255,54 @@ app.post("/proxy/create-draft-order", async (req, res) => {
 
     const customerId = await findOrCreateCustomer(customer);
 
+    // ----- build readable note + structured note_attributes
+    const fullName = [customer.first_name, customer.last_name].filter(Boolean).join(" ");
+    const contactBits = [
+      customer.email && `Email: ${customer.email}`,
+      customer.phone && `Phone: ${customer.phone}`,
+      customer.company && `Company: ${customer.company}`,
+    ].filter(Boolean).join(" • ");
+
+    const shippingAddr = shipping?.address1
+      ? [
+          shipping.address1,
+          shipping.address2,
+          [shipping.city, shipping.province, shipping.zip].filter(Boolean).join(", "),
+          shipping.country || "United States",
+        ].filter(Boolean).join("\n    ")
+      : "";
+
+    const prettyNote = [
+      "RFQ from storefront",
+      fullName && `Customer: ${fullName}`,
+      contactBits,
+      shipping_method && `Ship method: ${shipping_method}`,
+      `Installer needed: ${installer_needed ? "Yes" : "No"}`,
+      shippingAddr && `Ship to:\n    ${shippingAddr}`,
+      note && `Message: ${note}`,
+    ].filter(Boolean).join("\n");
+
+    const note_attributes = [
+      { name: "rfq_installer_needed", value: installer_needed ? "Yes" : "No" },
+      { name: "rfq_shipping_method",  value: shipping_method || "" },
+
+      { name: "rfq_customer_first_name", value: customer.first_name || "" },
+      { name: "rfq_customer_last_name",  value: customer.last_name  || "" },
+      { name: "rfq_customer_email",      value: customer.email      || "" },
+      { name: "rfq_customer_phone",      value: customer.phone      || "" },
+      { name: "rfq_customer_company",    value: customer.company    || "" },
+
+      { name: "rfq_message", value: note || "" },
+
+      { name: "rfq_address1", value: shipping.address1 || "" },
+      { name: "rfq_address2", value: shipping.address2 || "" },
+      { name: "rfq_city",     value: shipping.city     || "" },
+      { name: "rfq_province", value: shipping.province || "" },
+      { name: "rfq_zip",      value: shipping.zip      || "" },
+      { name: "rfq_country",  value: shipping.country  || "" },
+    ].filter(p => (p.value ?? "") !== "");
+
+    // ----- draft payload
     const payload = {
       draft_order: {
         line_items: line_items.map((li) => ({
@@ -307,29 +313,28 @@ app.post("/proxy/create-draft-order", async (req, res) => {
           properties: li.properties || []
         })),
         customer: { id: customerId },
+
+        // Only attach a shipping address when provided
         shipping_address: shipping?.address1
           ? {
               first_name: customer.first_name || "",
-              last_name: customer.last_name || "",
-              phone: customer.phone || "",
-              address1: shipping.address1,
-              address2: shipping.address2 || "",
-              city: shipping.city || "",
-              province: shipping.province || "",
-              zip: shipping.zip || "",
-              country: shipping.country || "United States",
-              company: shipping.company || ""
+              last_name:  customer.last_name  || "",
+              phone:      customer.phone      || "",
+              address1:   shipping.address1,
+              address2:   shipping.address2 || "",
+              city:       shipping.city     || "",
+              province:   shipping.province || "",
+              zip:        shipping.zip      || "",
+              country:    shipping.country  || "United States",
+              company:    customer.company  || ""
             }
           : undefined,
-        note: [
-          "RFQ from storefront",
-          `Installer needed: ${installer_needed ? "Yes" : "No"}`,
-          `Ship method: ${shipping_method || "N/A"}`,
-          note || ""
-        ]
-          .filter(Boolean)
-          .join(" | "),
-        tags: "RFQ,DraftOrder",
+
+        // Human-friendly note + structured attributes
+        note: prettyNote,
+        note_attributes,
+
+        tags: "RFQ,DraftOrder,WebForm",
         use_customer_default_address: true
       }
     };
@@ -341,15 +346,25 @@ app.post("/proxy/create-draft-order", async (req, res) => {
       body: JSON.stringify(payload)
     });
 
-    const invoice = out?.draft_order?.invoice_url;
-    if (!invoice) throw new Error("No invoice_url returned");
+    const id = out?.draft_order?.id;
+    const invoice = out?.draft_order?.invoice_url || null;
+    if (!id) throw new Error("No draft order id returned");
 
-    DBG("draft_order_id:", out.draft_order.id, "invoice_url:", invoice);
+    const adminUrl = `https://${process.env.SHOP}/admin/draft_orders/${id}`;
+    DBG("draft_order_id:", id, "admin_url:", adminUrl, "invoice_url:", invoice);
 
-    res.json({
-      invoice_url: invoice,
-      draft_order_id: out.draft_order.id
-    });
+    // ======= Response shape =======
+    // Default: reference + admin link (+ invoice_url if you want to send/open later)
+    if (req.query.verbose === "1") {
+      return res.json({
+        reference: id,
+        admin_url: adminUrl,
+        draft_order_id: id,
+        invoice_url: invoice
+      });
+    }
+    return res.json({ reference: id, admin_url: adminUrl, invoice_url: invoice });
+    // ===============================
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message });
