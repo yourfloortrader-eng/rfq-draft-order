@@ -2,14 +2,18 @@
   "name": "rfq-draft-order",
   "version": "1.0.0",
   "description": "Shopify RFQ Draft Order App (App Proxy -> Render)",
-  "type": "module",
+  "type": "module",                       // ESM enabled (keeps import/export syntax working)
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",            // Start server (used by Render)
+    "dev": "DEBUG_PROXY=1 node server.js" // Local dev with debug logging enabled
   },
   "dependencies": {
-    "dotenv": "^16.4.5",
-    "express": "^4.18.2",
-    "node-fetch": "^3.3.2"
+    "dotenv": "^16.4.5",                  // Loads .env file locally
+    "express": "^4.18.2",                 // Web framework
+    "node-fetch": "^3.3.2"                // Native ESM fetch polyfill
+  },
+  "engines": {
+    "node": ">=18.x"                      // Render & local must use Node 18+ (supports fetch & crypto.timingSafeEqual)
   }
 }
