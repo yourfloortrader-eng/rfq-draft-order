@@ -1,4 +1,4 @@
-// server.js (deploy-ready)
+// server.js (deploy-ready, safe diagnostics, graceful shutdown)
 import express from "express";
 import crypto from "crypto";
 import fetch from "node-fetch";
@@ -12,15 +12,12 @@ const REQUIRED = [
   "SHOP",                 // floortaderwholesale.myshopify.com
   "API_VERSION",          // e.g. 2025-07
   "SHOPIFY_ADMIN_TOKEN",  // shpat_...
-  "SHOPIFY_API_SECRET"    // from Admin API credentials
+  "SHOPIFY_API_SECRET"    // from Admin API credentials (App Proxy)
 ];
 
 const missing = REQUIRED.filter((k) => !process.env[k]);
 if (missing.length) {
-  console.error(
-    "Missing required environment variables:",
-    missing.join(", ")
-  );
+  console.error("Missing required environment variables:", missing.join(", "));
   process.exit(1);
 }
 
@@ -29,18 +26,18 @@ const DEBUG = process.env.DEBUG_PROXY === "1";
 const ALLOW_UNVERIFIED = process.env.ALLOW_UNVERIFIED_PROXY === "1";
 const PROXY_PREFIX = process.env.PROXY_PREFIX || "apps";
 const PROXY_SUBPATH = process.env.PROXY_SUBPATH || "rfq";
-const MOUNT_PREFIX = "/proxy"; // where the server endpoint is mounted
+const MOUNT_PREFIX = "/proxy"; // where endpoints are mounted (matches store App Proxy)
 
-// Show safe diagnostics (no secrets)
 if (DEBUG) {
   const t = process.env.SHOPIFY_ADMIN_TOKEN || "";
-  console.log("DEBUG mode ON");
-  console.log("ADMIN TOKEN LENGTH:", t.length);
+  console.log("=== DEBUG BOOT ===");
   console.log("SHOP:", process.env.SHOP);
   console.log("API_VERSION:", process.env.API_VERSION);
   console.log("PROXY_PREFIX:", PROXY_PREFIX);
   console.log("PROXY_SUBPATH:", PROXY_SUBPATH);
   console.log("ALLOW_UNVERIFIED_PROXY:", ALLOW_UNVERIFIED ? "1" : "0");
+  console.log("ADMIN TOKEN LENGTH:", t.length);
+  console.log("==================");
 }
 
 /* ===============
@@ -48,12 +45,9 @@ if (DEBUG) {
    =============== */
 const app = express();
 app.set("trust proxy", true);
+app.use(express.json({ limit: "100kb" })); // safe default
 
-// Body limit: protect server. Increase if you expect larger payloads.
-app.use(express.json({ limit: "100kb" }));
-
-// (Optional) very light CORS allow-list for your storefront domain(s).
-// Comment this out if your App Proxy calls are same-origin.
+// Optional CORS (only if you set CORS_ALLOW_ORIGINS)
 const CORS_ALLOW = (process.env.CORS_ALLOW_ORIGINS || "")
   .split(",")
   .map((s) => s.trim())
@@ -67,8 +61,8 @@ if (CORS_ALLOW.length) {
       res.setHeader("Vary", "Origin");
       res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
       res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
-      if (req.method === "OPTIONS") return res.sendStatus(204);
     }
+    if (req.method === "OPTIONS") return res.sendStatus(204);
     next();
   });
 }
@@ -97,21 +91,14 @@ function verifyProxySignature(req) {
     const originalUrl = req.originalUrl || req.url || "/";
     const qmark = originalUrl.indexOf("?");
     const rawPath = qmark === -1 ? originalUrl : originalUrl.slice(0, qmark);
-    const rawQuery = qmark === -1 ? "" : originalUrl.slice(qmark + 1); // without leading "?"
+    const rawQuery = qmark === -1 ? "" : originalUrl.slice(qmark + 1);
 
     // Extract provided signature OR hmac
     let providedSignature = "";
     if (rawQuery) {
-      const pairs = rawQuery.split("&");
-      for (const kv of pairs) {
-        if (kv.startsWith("signature=")) {
-          providedSignature = kv.slice("signature=".length);
-          break;
-        }
-        if (kv.startsWith("hmac=")) {
-          providedSignature = kv.slice("hmac=".length);
-          break;
-        }
+      for (const kv of rawQuery.split("&")) {
+        if (kv.startsWith("signature=")) { providedSignature = kv.slice("signature=".length); break; }
+        if (kv.startsWith("hmac="))      { providedSignature = kv.slice("hmac=".length);       break; }
       }
     }
     if (!providedSignature) {
@@ -127,24 +114,18 @@ function verifyProxySignature(req) {
     // Build storefront path: decoded path_prefix + serverPathname
     let decodedPathPrefix = "";
     if (rawQuery) {
-      const pairs = rawQuery.split("&");
-      for (const kv of pairs) {
+      for (const kv of rawQuery.split("&")) {
         const eq = kv.indexOf("=");
         const key = eq === -1 ? kv : kv.slice(0, eq);
         const val = eq === -1 ? "" : kv.slice(eq + 1);
         if (key === "path_prefix") {
-          try {
-            decodedPathPrefix = decodeURIComponent(val || "");
-          } catch {
-            decodedPathPrefix = val || "";
-          }
+          try { decodedPathPrefix = decodeURIComponent(val || ""); }
+          catch { decodedPathPrefix = val || ""; }
           break;
         }
       }
     }
-    if (!decodedPathPrefix) {
-      decodedPathPrefix = `/${PROXY_PREFIX}/${PROXY_SUBPATH}`;
-    }
+    if (!decodedPathPrefix) decodedPathPrefix = `/${PROXY_PREFIX}/${PROXY_SUBPATH}`;
 
     const storefrontPath = `${decodedPathPrefix}${serverPathname}`;
 
@@ -159,11 +140,10 @@ function verifyProxySignature(req) {
       keptQuery = kept.join("&");
     }
 
-    // Build message
+    // Build message and compute HMAC
     const message = keptQuery ? `${storefrontPath}?${keptQuery}` : storefrontPath;
-
-    // Compute digest + timing-safe compare
     const digest = crypto.createHmac("sha256", secret).update(message, "utf8").digest("hex");
+
     const sigBuf = Buffer.from(providedSignature, "utf8");
     const digBuf = Buffer.from(digest, "utf8");
     const ok = sigBuf.length === digBuf.length && crypto.timingSafeEqual(digBuf, sigBuf);
@@ -209,18 +189,13 @@ if (DEBUG) {
           const key = eq === -1 ? kv : kv.slice(0, eq);
           const val = eq === -1 ? "" : kv.slice(eq + 1);
           if (key === "path_prefix") {
-            try {
-              decodedPathPrefix = decodeURIComponent(val || "");
-            } catch {
-              decodedPathPrefix = val || "";
-            }
+            try { decodedPathPrefix = decodeURIComponent(val || ""); }
+            catch { decodedPathPrefix = val || ""; }
             break;
           }
         }
       }
-      if (!decodedPathPrefix) {
-        decodedPathPrefix = `/${PROXY_PREFIX}/${PROXY_SUBPATH}`;
-      }
+      if (!decodedPathPrefix) decodedPathPrefix = `/${PROXY_PREFIX}/${PROXY_SUBPATH}`;
 
       const storefrontPath = `${decodedPathPrefix}${serverPathname}`;
 
@@ -304,6 +279,9 @@ async function findOrCreateCustomer(cust) {
 app.get(`${MOUNT_PREFIX}/create-draft-order`, (_req, res) =>
   res.status(405).json({ error: "Method Not Allowed" })
 );
+
+// Allow preflight explicitly (if CORS is used)
+app.options(`${MOUNT_PREFIX}/create-draft-order`, (_req, res) => res.sendStatus(204));
 
 app.post(`${MOUNT_PREFIX}/create-draft-order`, async (req, res) => {
   try {
