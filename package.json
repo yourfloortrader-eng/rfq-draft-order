@@ -4,20 +4,32 @@
   "description": "Shopify RFQ Draft Order App (App Proxy -> Render)",
   "type": "module",
   "main": "server.js",
+
   "scripts": {
-    "start": "node server.js",                          
+    // Production start (used by Render)
+    "start": "node server.js",
+
+    // Local development with debug logs and proxy bypass
     "dev": "cross-env DEBUG_PROXY=1 ALLOW_UNVERIFIED_PROXY=1 node server.js",
+
+    // Simple health check (runs locally, not in Render)
     "health": "node -e \"fetch('http://localhost:3000/healthz').then(r=>r.text()).then(console.log)\""
   },
+
   "dependencies": {
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "node-fetch": "^3.3.2"
   },
+
   "devDependencies": {
     "cross-env": "^7.0.3"
   },
+
   "engines": {
-    "node": ">=18"
-  }
+    "node": ">=18.x"
+  },
+
+  // Recommended to avoid accidental publish to npm
+  "private": true
 }
