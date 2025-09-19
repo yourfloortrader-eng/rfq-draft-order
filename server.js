@@ -9,15 +9,19 @@ dotenv.config();
    0) ENV VALIDATION / CONFIG
    ========================= */
 const REQUIRED = [
-  "SHOP",                 // floortaderwholesale.myshopify.com
+  "SHOP",                 // e.g. yourstore.myshopify.com
   "API_VERSION",          // e.g. 2025-07
   "SHOPIFY_ADMIN_TOKEN",  // shpat_...
-  "SHOPIFY_API_SECRET"    // from Admin API credentials (App Proxy)
+  "SHOPIFY_API_SECRET"    // App's Admin API secret key (used for App Proxy HMAC)
 ];
 
 const missing = REQUIRED.filter((k) => !process.env[k]);
 if (missing.length) {
-  console.error("Missing required environment variables:", missing.join(", "));
+  console.error("❌ Missing required environment variables:", missing.join(", "));
+  console.error(
+    "Set them in your hosting provider's environment settings. Required keys:",
+    REQUIRED.join(", ")
+  );
   process.exit(1);
 }
 
@@ -45,7 +49,19 @@ if (DEBUG) {
    =============== */
 const app = express();
 app.set("trust proxy", true);
-app.use(express.json({ limit: "100kb" })); // safe default
+app.disable("x-powered-by");
+
+// Robust JSON body parsing with friendly errors
+app.use(express.json({ limit: "100kb" }));
+app.use((err, _req, res, next) => {
+  if (err && err.type === "entity.too.large") {
+    return res.status(413).json({ error: "Payload too large" });
+  }
+  if (err instanceof SyntaxError) {
+    return res.status(400).json({ error: "Invalid JSON" });
+  }
+  next(err);
+});
 
 // Optional CORS (only if you set CORS_ALLOW_ORIGINS)
 const CORS_ALLOW = (process.env.CORS_ALLOW_ORIGINS || "")
@@ -60,12 +76,15 @@ if (CORS_ALLOW.length) {
       res.setHeader("Access-Control-Allow-Origin", o);
       res.setHeader("Vary", "Origin");
       res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
-      res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
+      res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS,GET");
     }
     if (req.method === "OPTIONS") return res.sendStatus(204);
     next();
   });
 }
+
+// Preflight at the proxy root so future endpoints are covered
+app.options(`${MOUNT_PREFIX}/*`, (_req, res) => res.sendStatus(204));
 
 // Small helper logger
 const DBG = (...args) => {
@@ -75,6 +94,8 @@ const DBG = (...args) => {
 // Health + root
 app.get("/", (_req, res) => res.send("RFQ app running"));
 app.get("/healthz", (_req, res) => res.send("ok"));
+// Health at mount (useful for provider path checks)
+app.get(`${MOUNT_PREFIX}/_health`, (_req, res) => res.send("ok"));
 
 /* ================================
    2) SHOPIFY APP PROXY VERIFICATION
@@ -280,9 +301,6 @@ app.get(`${MOUNT_PREFIX}/create-draft-order`, (_req, res) =>
   res.status(405).json({ error: "Method Not Allowed" })
 );
 
-// Allow preflight explicitly (if CORS is used)
-app.options(`${MOUNT_PREFIX}/create-draft-order`, (_req, res) => res.sendStatus(204));
-
 app.post(`${MOUNT_PREFIX}/create-draft-order`, async (req, res) => {
   try {
     DBG("incoming host:", req.headers.host);
@@ -404,7 +422,6 @@ app.post(`${MOUNT_PREFIX}/create-draft-order`, async (req, res) => {
     const adminUrl = `https://${process.env.SHOP}/admin/draft_orders/${id}`;
     DBG("draft_order_id:", id, "admin_url:", adminUrl, "invoice_url:", invoice);
 
-    // Default response: reference + admin link (+invoice if you want to open later)
     if (req.query.verbose === "1") {
       return res.json({
         reference: id,
@@ -441,9 +458,7 @@ function shutdown(signal) {
     console.log("HTTP server closed.");
     process.exit(0);
   });
-  // Force-exit if close hangs
   setTimeout(() => process.exit(1), 10_000).unref();
 }
-
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
