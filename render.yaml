@@ -24,6 +24,6 @@ services:
       - key: PROXY_SUBPATH
         value: rfq
       - key: DEBUG_PROXY
-        value: "0"
+        value: "1"
       - key: ALLOW_UNVERIFIED_PROXY
-        value: "0"
+        value: "1"
