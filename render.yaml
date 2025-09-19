@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: rfq-draft-order
+    env: node
+    region: oregon
+    plan: starter
+    buildCommand: npm install
+    startCommand: npm start
+    autoDeploy: true
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_VERSION
+        value: 18
+      - key: SHOP
+        sync: false
+      - key: API_VERSION
+        value: 2025-07
+      - key: SHOPIFY_ADMIN_TOKEN
+        sync: false
+      - key: SHOPIFY_API_SECRET
+        sync: false
+      - key: PROXY_PREFIX
+        value: apps
+      - key: PROXY_SUBPATH
+        value: rfq
+      - key: DEBUG_PROXY
+        value: "0"
+      - key: ALLOW_UNVERIFIED_PROXY
+        value: "0"
