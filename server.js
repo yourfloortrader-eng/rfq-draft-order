@@ -1,4 +1,4 @@
-// server.js (deploy-ready, safe diagnostics, graceful shutdown)
+// server.js (deploy-ready, robust custom-line price support, safe diagnostics, graceful shutdown)
 import express from "express";
 import crypto from "crypto";
 import fetch from "node-fetch";
@@ -18,10 +18,7 @@ const REQUIRED = [
 const missing = REQUIRED.filter((k) => !process.env[k]);
 if (missing.length) {
   console.error("❌ Missing required environment variables:", missing.join(", "));
-  console.error(
-    "Set them in your hosting provider's environment settings. Required keys:",
-    REQUIRED.join(", ")
-  );
+  console.error("Set them where you host the service. Required keys:", REQUIRED.join(", "));
   process.exit(1);
 }
 
@@ -30,7 +27,7 @@ const DEBUG = process.env.DEBUG_PROXY === "1";
 const ALLOW_UNVERIFIED = process.env.ALLOW_UNVERIFIED_PROXY === "1";
 const PROXY_PREFIX = process.env.PROXY_PREFIX || "apps";
 const PROXY_SUBPATH = process.env.PROXY_SUBPATH || "rfq";
-const MOUNT_PREFIX = "/proxy"; // where endpoints are mounted (matches store App Proxy)
+const MOUNT_PREFIX = "/proxy"; // server path that mirrors your App Proxy path
 
 if (DEBUG) {
   const t = process.env.SHOPIFY_ADMIN_TOKEN || "";
@@ -51,7 +48,7 @@ const app = express();
 app.set("trust proxy", true);
 app.disable("x-powered-by");
 
-// Robust JSON body parsing with friendly errors
+// JSON parsing + friendly errors
 app.use(express.json({ limit: "100kb" }));
 app.use((err, _req, res, next) => {
   if (err && err.type === "entity.too.large") {
@@ -63,7 +60,7 @@ app.use((err, _req, res, next) => {
   next(err);
 });
 
-// Optional CORS (only if you set CORS_ALLOW_ORIGINS)
+// Optional CORS (only if you set CORS_ALLOW_ORIGINS, comma-separated)
 const CORS_ALLOW = (process.env.CORS_ALLOW_ORIGINS || "")
   .split(",")
   .map((s) => s.trim())
@@ -83,18 +80,15 @@ if (CORS_ALLOW.length) {
   });
 }
 
-// Preflight at the proxy root so future endpoints are covered
+// Preflight convenience
 app.options(`${MOUNT_PREFIX}/*`, (_req, res) => res.sendStatus(204));
 
-// Small helper logger
-const DBG = (...args) => {
-  if (DEBUG) console.log("[proxy]", ...args);
-};
+// Helper logger
+const DBG = (...args) => { if (DEBUG) console.log("[proxy]", ...args); };
 
-// Health + root
+// Health
 app.get("/", (_req, res) => res.send("RFQ app running"));
 app.get("/healthz", (_req, res) => res.send("ok"));
-// Health at mount (useful for provider path checks)
 app.get(`${MOUNT_PREFIX}/_health`, (_req, res) => res.send("ok"));
 
 /* ================================
@@ -127,9 +121,9 @@ function verifyProxySignature(req) {
       return false;
     }
 
-    // Remove our own mount prefix from the path
+    // Remove server mount prefix
     const serverPathname = rawPath.startsWith(MOUNT_PREFIX)
-      ? rawPath.slice(MOUNT_PREFIX.length) // e.g. "/create-draft-order"
+      ? rawPath.slice(MOUNT_PREFIX.length)
       : rawPath;
 
     // Build storefront path: decoded path_prefix + serverPathname
@@ -150,7 +144,7 @@ function verifyProxySignature(req) {
 
     const storefrontPath = `${decodedPathPrefix}${serverPathname}`;
 
-    // Keep query string as-is but drop signature/hmac
+    // Keep query minus signature/hmac
     let keptQuery = "";
     if (rawQuery) {
       const kept = [];
@@ -161,7 +155,6 @@ function verifyProxySignature(req) {
       keptQuery = kept.join("&");
     }
 
-    // Build message and compute HMAC
     const message = keptQuery ? `${storefrontPath}?${keptQuery}` : storefrontPath;
     const digest = crypto.createHmac("sha256", secret).update(message, "utf8").digest("hex");
 
@@ -293,7 +286,61 @@ async function findOrCreateCustomer(cust) {
 }
 
 /* ==========================
-   4) MAIN RFQ / DRAFT ENDPOINT
+   4) LINE ITEM NORMALIZATION
+   ========================== */
+
+/**
+ * Convert any value into a 2-decimal price string.
+ * Accepts number or numeric string.
+ */
+function toPriceString(v) {
+  const n = Number(v);
+  if (!isFinite(n)) return null;
+  return n.toFixed(2);
+}
+
+/**
+ * Build a Shopify line_item object from upstream data.
+ * Supports:
+ *   - variant line: { variant_id, quantity, properties }
+ *   - custom  line: { title, price? | unitPrice? | unitPriceCents?, quantity, properties }
+ */
+function normalizeLineItem(input = {}) {
+  const quantity = Number(input.quantity || 1);
+
+  if (input.variant_id) {
+    return {
+      variant_id: Number(input.variant_id),
+      quantity,
+      properties: Array.isArray(input.properties) ? input.properties : []
+    };
+  }
+
+  // Custom line item: resolve price in priority order
+  let price =
+    // already provided as "10.00" or 10.00
+    (input.price != null && toPriceString(input.price)) ||
+    // unitPrice (number or string)
+    (input.unitPrice != null && toPriceString(input.unitPrice)) ||
+    // unitPriceCents (integer cents)
+    (input.unitPriceCents != null && toPriceString(Number(input.unitPriceCents) / 100));
+
+  if (!price) {
+    throw new Error("Missing price for custom line item (provide price, unitPrice, or unitPriceCents).");
+  }
+
+  const title = input.title || "RFQ Item";
+
+  return {
+    title,
+    price,
+    quantity,
+    properties: Array.isArray(input.properties) ? input.properties : []
+  };
+}
+
+/* ==========================
+   5) MAIN RFQ / DRAFT ENDPOINT
    ========================== */
 
 // Disallow GET for safety
@@ -329,6 +376,14 @@ app.post(`${MOUNT_PREFIX}/create-draft-order`, async (req, res) => {
 
     if (!Array.isArray(line_items) || line_items.length === 0) {
       return res.status(400).json({ error: "No line items" });
+    }
+
+    // Normalize line items (auto-handle custom price derivation)
+    let normalizedLineItems;
+    try {
+      normalizedLineItems = line_items.map(normalizeLineItem);
+    } catch (e) {
+      return res.status(400).json({ error: String(e.message || e) });
     }
 
     const customerId = await findOrCreateCustomer(customer);
@@ -379,13 +434,7 @@ app.post(`${MOUNT_PREFIX}/create-draft-order`, async (req, res) => {
 
     const payload = {
       draft_order: {
-        line_items: line_items.map((li) => ({
-          ...(li.variant_id
-            ? { variant_id: Number(li.variant_id) }
-            : { title: li.title, price: li.price }),
-          quantity: Number(li.quantity || 1),
-          properties: li.properties || []
-        })),
+        line_items: normalizedLineItems,
         customer: { id: customerId },
         shipping_address: shipping?.address1
           ? {
@@ -422,6 +471,7 @@ app.post(`${MOUNT_PREFIX}/create-draft-order`, async (req, res) => {
     const adminUrl = `https://${process.env.SHOP}/admin/draft_orders/${id}`;
     DBG("draft_order_id:", id, "admin_url:", adminUrl, "invoice_url:", invoice);
 
+    // Verbose mode (testing) returns extra fields
     if (req.query.verbose === "1") {
       return res.json({
         reference: id,
@@ -430,6 +480,7 @@ app.post(`${MOUNT_PREFIX}/create-draft-order`, async (req, res) => {
         invoice_url: invoice
       });
     }
+    // Default (minimal)
     return res.json({ reference: id, admin_url: adminUrl, invoice_url: invoice });
   } catch (e) {
     console.error(e);
@@ -438,14 +489,14 @@ app.post(`${MOUNT_PREFIX}/create-draft-order`, async (req, res) => {
 });
 
 /* ==================
-   5) FALLBACK / ERRORS
+   6) FALLBACK / ERRORS
    ================== */
 app.use((req, res) => {
   res.status(404).json({ error: "Not Found" });
 });
 
 /* =======================
-   6) START & GRACEFUL STOP
+   7) START & GRACEFUL STOP
    ======================= */
 const port = process.env.PORT || 3000;
 const server = app.listen(port, () => {
