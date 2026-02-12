@@ -10,7 +10,7 @@ dotenv.config();
    ========================= */
 const REQUIRED = [
   "SHOP",                 // e.g. yourstore.myshopify.com
-  "API_VERSION",          // e.g. 2025-07
+  "API_VERSION",          // e.g. 2024-10
   "SHOPIFY_ADMIN_TOKEN",  // shpat_...
   "SHOPIFY_API_SECRET"    // App's Admin API secret key (used for App Proxy HMAC)
 ];
@@ -102,7 +102,6 @@ function verifyProxySignature(req) {
       return false;
     }
 
-    // e.g. "/proxy/create-draft-order?shop=...&path_prefix=%2Fapps%2Frfq&timestamp=...&signature=..."
     const originalUrl = req.originalUrl || req.url || "/";
     const qmark = originalUrl.indexOf("?");
     const rawPath = qmark === -1 ? originalUrl : originalUrl.slice(0, qmark);
@@ -251,22 +250,32 @@ async function adminFetch(path, options = {}) {
       ...(options.headers || {})
     }
   });
+
   if (!res.ok) {
     const text = await res.text();
     DBG("adminFetch error:", res.status, text);
-    throw new Error(`${res.status} ${text}`);
+
+    // ✅ structured error so we can return real status/body to frontend
+    const err = new Error("SHOPIFY_ADMIN_API_ERROR");
+    err.status = res.status;
+    err.body = text;
+    err.path = path;
+    throw err;
   }
+
   return res.json();
 }
 
 async function findOrCreateCustomer(cust) {
   let id = null;
+
   if (cust.email) {
     const r = await adminFetch(
       `/customers/search.json?query=${encodeURIComponent(`email:${cust.email}`)}`
     );
     id = r.customers?.[0]?.id || null;
   }
+
   if (!id) {
     const c = await adminFetch(`/customers.json`, {
       method: "POST",
@@ -282,6 +291,7 @@ async function findOrCreateCustomer(cust) {
     });
     id = c.customer.id;
   }
+
   return id;
 }
 
@@ -308,6 +318,7 @@ function toPriceString(v) {
 function normalizeLineItem(input = {}) {
   const quantity = Number(input.quantity || 1);
 
+  // Variant line item (Shopify will use product pricing)
   if (input.variant_id) {
     return {
       variant_id: Number(input.variant_id),
@@ -385,6 +396,9 @@ app.post(`${MOUNT_PREFIX}/create-draft-order`, async (req, res) => {
     } catch (e) {
       return res.status(400).json({ error: String(e.message || e) });
     }
+
+    // Helpful debug (only in DEBUG mode)
+    DBG("normalizedLineItems:", JSON.stringify(normalizedLineItems));
 
     const customerId = await findOrCreateCustomer(customer);
 
@@ -482,9 +496,26 @@ app.post(`${MOUNT_PREFIX}/create-draft-order`, async (req, res) => {
     }
     // Default (minimal)
     return res.json({ reference: id, admin_url: adminUrl, invoice_url: invoice });
+
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: e.message });
+    // ✅ Return real Shopify errors to the frontend (instead of masking as 500)
+    if (e && e.message === "SHOPIFY_ADMIN_API_ERROR") {
+      console.error("Shopify Admin API Error:", {
+        status: e.status,
+        path: e.path,
+        body: e.body
+      });
+
+      return res.status(e.status || 502).json({
+        error: "Shopify Admin API error",
+        status: e.status || 502,
+        path: e.path || "",
+        details: e.body || ""
+      });
+    }
+
+    console.error("Server error:", e);
+    return res.status(500).json({ error: e?.message || String(e) });
   }
 });
 
