@@ -266,33 +266,70 @@ async function adminFetch(path, options = {}) {
   return res.json();
 }
 
+/**
+ * Find customer by email, then phone; create if missing.
+ * If create fails due to phone conflict, retry create WITHOUT phone.
+ */
 async function findOrCreateCustomer(cust) {
   let id = null;
 
+  // 1) Try by email
   if (cust.email) {
     const r = await adminFetch(
       `/customers/search.json?query=${encodeURIComponent(`email:${cust.email}`)}`
     );
     id = r.customers?.[0]?.id || null;
+    if (id) return id;
   }
 
-  if (!id) {
+  // 2) Try by phone
+  const phone = (cust.phone || "").trim();
+  if (phone) {
+    const r2 = await adminFetch(
+      `/customers/search.json?query=${encodeURIComponent(`phone:${phone}`)}`
+    );
+    id = r2.customers?.[0]?.id || null;
+    if (id) return id;
+  }
+
+  // 3) Create
+  const payload = {
+    customer: {
+      email: cust.email || undefined,
+      first_name: cust.first_name || "",
+      last_name: cust.last_name || "",
+      verified_email: !!cust.email
+    }
+  };
+  if (phone) payload.customer.phone = phone;
+
+  try {
     const c = await adminFetch(`/customers.json`, {
       method: "POST",
-      body: JSON.stringify({
+      body: JSON.stringify(payload)
+    });
+    return c.customer.id;
+  } catch (e) {
+    // If phone is taken, retry WITHOUT phone so the draft order can proceed
+    const body = String(e?.body || "");
+    if (e && e.message === "SHOPIFY_ADMIN_API_ERROR" && e.status === 422 && body.includes('"phone"')) {
+      DBG("Customer create failed due to phone conflict; retrying without phone…");
+      const payload2 = {
         customer: {
-          email: cust.email,
-          first_name: cust.first_name,
-          last_name: cust.last_name,
-          phone: cust.phone,
+          email: cust.email || undefined,
+          first_name: cust.first_name || "",
+          last_name: cust.last_name || "",
           verified_email: !!cust.email
         }
-      })
-    });
-    id = c.customer.id;
+      };
+      const c2 = await adminFetch(`/customers.json`, {
+        method: "POST",
+        body: JSON.stringify(payload2)
+      });
+      return c2.customer.id;
+    }
+    throw e;
   }
-
-  return id;
 }
 
 /* ==========================
@@ -318,7 +355,6 @@ function toPriceString(v) {
 function normalizeLineItem(input = {}) {
   const quantity = Number(input.quantity || 1);
 
-  // Variant line item (Shopify will use product pricing)
   if (input.variant_id) {
     return {
       variant_id: Number(input.variant_id),
@@ -329,11 +365,8 @@ function normalizeLineItem(input = {}) {
 
   // Custom line item: resolve price in priority order
   let price =
-    // already provided as "10.00" or 10.00
     (input.price != null && toPriceString(input.price)) ||
-    // unitPrice (number or string)
     (input.unitPrice != null && toPriceString(input.unitPrice)) ||
-    // unitPriceCents (integer cents)
     (input.unitPriceCents != null && toPriceString(Number(input.unitPriceCents) / 100));
 
   if (!price) {
@@ -389,7 +422,7 @@ app.post(`${MOUNT_PREFIX}/create-draft-order`, async (req, res) => {
       return res.status(400).json({ error: "No line items" });
     }
 
-    // Normalize line items (auto-handle custom price derivation)
+    // Normalize line items
     let normalizedLineItems;
     try {
       normalizedLineItems = line_items.map(normalizeLineItem);
@@ -397,7 +430,6 @@ app.post(`${MOUNT_PREFIX}/create-draft-order`, async (req, res) => {
       return res.status(400).json({ error: String(e.message || e) });
     }
 
-    // Helpful debug (only in DEBUG mode)
     DBG("normalizedLineItems:", JSON.stringify(normalizedLineItems));
 
     const customerId = await findOrCreateCustomer(customer);
@@ -485,7 +517,6 @@ app.post(`${MOUNT_PREFIX}/create-draft-order`, async (req, res) => {
     const adminUrl = `https://${process.env.SHOP}/admin/draft_orders/${id}`;
     DBG("draft_order_id:", id, "admin_url:", adminUrl, "invoice_url:", invoice);
 
-    // Verbose mode (testing) returns extra fields
     if (req.query.verbose === "1") {
       return res.json({
         reference: id,
@@ -494,7 +525,6 @@ app.post(`${MOUNT_PREFIX}/create-draft-order`, async (req, res) => {
         invoice_url: invoice
       });
     }
-    // Default (minimal)
     return res.json({ reference: id, admin_url: adminUrl, invoice_url: invoice });
 
   } catch (e) {
